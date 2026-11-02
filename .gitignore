@@ -1,0 +1,15 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Llave privada generada por Terraform
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
