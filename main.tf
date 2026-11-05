@@ -1,23 +1,26 @@
 terraform {
-  required_version = ">= 1.5.0"
+  # use_lockfile (candado del state en S3 sin DynamoDB) requiere Terraform >= 1.10
+  required_version = ">= 1.10.0"
 
   required_providers {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    tls = {
-      source  = "hashicorp/tls"
-      version = "~> 4.0"
-    }
-    local = {
-      source  = "hashicorp/local"
-      version = "~> 2.5"
-    }
     random = {
       source  = "hashicorp/random"
       version = "~> 3.6"
     }
+  }
+
+  # El tfstate vive en S3, no en la compu ni en el runner de GitHub.
+  # El bucket se pasa al hacer init (los workflows lo crean si no existe):
+  #   terraform init -backend-config="bucket=tfstate-to-do-list-api-<ACCOUNT_ID>"
+  backend "s3" {
+    key          = "to-do-list-api/terraform.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true
   }
 }
 
@@ -25,15 +28,20 @@ terraform {
 # Variables
 # ---------------------------------------------------------------------------
 variable "region" {
-  description = "Region de AWS"
+  description = "Region de AWS (Learner Lab: us-east-1 o us-west-2)"
   type        = string
   default     = "us-east-1"
 }
 
-variable "repo_url" {
-  description = "URL publica de tu repo en GitHub (CAMBIA TU_USUARIO)"
+variable "github_repo" {
+  description = "Repositorio publico en formato owner/nombre. Los workflows lo pasan solos."
   type        = string
-  default     = "https://github.com/TU_USUARIO/to-do-list-api.git"
+  default     = "TU_USUARIO/to-do-list-api"
+}
+
+variable "ssh_public_key" {
+  description = "Llave publica SSH (contenido de todo-list-key.pub). Los workflows la sacan del secret EC2_SSH_KEY."
+  type        = string
 }
 
 variable "instance_type" {
@@ -42,7 +50,7 @@ variable "instance_type" {
 }
 
 variable "ssh_cidr" {
-  description = "Desde donde se permite SSH. Idealmente tu IP: x.x.x.x/32"
+  description = "Desde donde se permite SSH. GitHub Actions necesita entrar para desplegar."
   type        = string
   default     = "0.0.0.0/0"
 }
@@ -50,7 +58,7 @@ variable "ssh_cidr" {
 variable "instance_profile_name" {
   description = <<-EOT
     Vacio = Terraform crea su propio IAM Role + Instance Profile.
-    Si usas AWS Academy / Learner Lab (no deja crear roles), pon "LabInstanceProfile".
+    En AWS Academy / Learner Lab (no deja crear roles) usa "LabInstanceProfile".
   EOT
   type        = string
   default     = ""
@@ -89,28 +97,19 @@ data "aws_ami" "al2023" {
 }
 
 # ---------------------------------------------------------------------------
-# Key Pair (igual que en la Parte 1)
+# Key Pair: la llave se genera una sola vez en tu compu (ssh-keygen) y la
+# privada vive en el secret EC2_SSH_KEY. Asi sobrevive a cada sandbox nuevo
+# y GitHub Actions puede entrar por SSH a desplegar.
 # ---------------------------------------------------------------------------
-resource "tls_private_key" "ssh" {
-  algorithm = "RSA"
-  rsa_bits  = 4096
-}
-
 resource "aws_key_pair" "todo" {
   key_name   = "todo-list-key"
-  public_key = tls_private_key.ssh.public_key_openssh
-}
-
-resource "local_sensitive_file" "private_key" {
-  content         = tls_private_key.ssh.private_key_pem
-  filename        = "${path.module}/todo-list-key.pem"
-  file_permission = "0400"
+  public_key = var.ssh_public_key
 }
 
 # ---------------------------------------------------------------------------
 # Security Groups
-#   app: SSH + API abiertos
-#   db : PostgreSQL (5432) SOLO desde el SG de la app  -> permiso de RED
+#   app: SSH + API
+#   db : PostgreSQL (5432) SOLO desde el SG de la app
 # ---------------------------------------------------------------------------
 resource "aws_security_group" "app" {
   name        = "todo-list-app-sg"
@@ -161,7 +160,7 @@ resource "aws_security_group" "db" {
 }
 
 # ---------------------------------------------------------------------------
-# RDS PostgreSQL (privada, sin IP publica)
+# RDS PostgreSQL (privada)
 # ---------------------------------------------------------------------------
 resource "random_password" "db" {
   length  = 24
@@ -180,7 +179,6 @@ resource "aws_db_instance" "todo" {
   vpc_security_group_ids = [aws_security_group.db.id]
   publicly_accessible    = false
 
-  # Para clase: que destroy sea rapido y sin snapshot final
   skip_final_snapshot     = true
   deletion_protection     = false
   backup_retention_period = 0
@@ -188,12 +186,12 @@ resource "aws_db_instance" "todo" {
 }
 
 # ---------------------------------------------------------------------------
-# Secrets Manager: aqui viven las credenciales, NO en el codigo
+# Secrets Manager: credenciales de la BD fuera del codigo
 # ---------------------------------------------------------------------------
 resource "aws_secretsmanager_secret" "db" {
   name_prefix             = "todo-list-db-"
   description             = "Credenciales de RDS para la to-do list API"
-  recovery_window_in_days = 0 # se borra de inmediato en destroy
+  recovery_window_in_days = 0
 }
 
 resource "aws_secretsmanager_secret_version" "db" {
@@ -208,7 +206,7 @@ resource "aws_secretsmanager_secret_version" "db" {
 }
 
 # ---------------------------------------------------------------------------
-# IAM: la EC2 asume un Role que SOLO puede leer ese secreto  -> permiso de IAM
+# IAM: Role con permiso SOLO para leer ese secreto
 # (se omite si usas un instance profile existente, p. ej. LabInstanceProfile)
 # ---------------------------------------------------------------------------
 locals {
@@ -257,7 +255,8 @@ locals {
 }
 
 # ---------------------------------------------------------------------------
-# EC2
+# EC2: user_data prepara la instancia y despliega el ultimo release
+# (o la rama main si todavia no hay releases)
 # ---------------------------------------------------------------------------
 resource "aws_instance" "app" {
   ami                         = data.aws_ami.al2023.id
@@ -268,47 +267,16 @@ resource "aws_instance" "app" {
   iam_instance_profile        = local.instance_profile
   user_data_replace_on_change = true
 
-  # La instancia se crea cuando la BD y el secreto ya existen
   depends_on = [
     aws_secretsmanager_secret_version.db,
     aws_iam_role_policy.read_db_secret,
   ]
 
-  user_data = <<-EOF
-    #!/bin/bash
-    set -euxo pipefail
-
-    dnf install -y git python3-pip
-    # Cliente psql para validar la BD desde la instancia
-    dnf install -y postgresql16 || dnf install -y postgresql15
-
-    git clone ${var.repo_url} /opt/todo
-    python3 -m venv /opt/todo/venv
-    /opt/todo/venv/bin/pip install --upgrade pip
-    /opt/todo/venv/bin/pip install -r /opt/todo/requirements.txt
-
-    cat > /etc/systemd/system/todo.service <<'UNIT'
-    [Unit]
-    Description=To-do list API
-    After=network-online.target
-    Wants=network-online.target
-
-    [Service]
-    WorkingDirectory=/opt/todo
-    Environment=PORT=5000
-    Environment=DB_SECRET_ID=${aws_secretsmanager_secret.db.name}
-    Environment=AWS_DEFAULT_REGION=${var.region}
-    ExecStart=/opt/todo/venv/bin/python /opt/todo/app.py
-    Restart=always
-    RestartSec=5
-
-    [Install]
-    WantedBy=multi-user.target
-    UNIT
-
-    systemctl daemon-reload
-    systemctl enable --now todo.service
-  EOF
+  user_data = templatefile("${path.module}/user_data.sh.tftpl", {
+    github_repo  = var.github_repo
+    db_secret_id = aws_secretsmanager_secret.db.name
+    region       = var.region
+  })
 
   tags = {
     Name = "todo-list-api"
@@ -326,8 +294,12 @@ output "api_url" {
   value = "http://${aws_instance.app.public_ip}:5000/tasks"
 }
 
+output "version_url" {
+  value = "http://${aws_instance.app.public_ip}:5000/version"
+}
+
 output "ssh" {
-  value = "ssh -i todo-list-key.pem ec2-user@${aws_instance.app.public_ip}"
+  value = "ssh -i ~/.ssh/todo-list-key ec2-user@${aws_instance.app.public_ip}"
 }
 
 output "db_endpoint" {

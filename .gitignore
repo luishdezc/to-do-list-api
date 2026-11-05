@@ -2,14 +2,18 @@
 .terraform/
 *.tfstate
 *.tfstate.*
+tfplan
 crash.log
 crash.*.log
 
-# Llave privada generada por Terraform
+# Llaves
 *.pem
+todo-list-key
+todo-list-key.pub
 
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
 venv/
 .venv/

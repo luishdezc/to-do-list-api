@@ -1,0 +1,136 @@
+name: Infra - apply
+
+# Boton manual: Actions > "Infra - apply" > Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      instance_profile_name:
+        description: "Instance profile de la EC2 (LabInstanceProfile en Learner Lab; vacio = Terraform crea el rol)"
+        required: false
+        default: "LabInstanceProfile"
+
+# Nunca dos corridas de Terraform al mismo tiempo (apply y destroy comparten grupo)
+concurrency:
+  group: terraform
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+  AWS_REGION: us-east-1
+  AWS_DEFAULT_REGION: us-east-1
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TF_VAR_github_repo: ${{ github.repository }}
+  TF_VAR_instance_profile_name: ${{ inputs.instance_profile_name }}
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Validar credenciales de AWS
+        run: |
+          if ! aws sts get-caller-identity; then
+            echo "::error::Las credenciales de AWS no funcionan. Si es un sandbox nuevo, actualiza AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY y AWS_SESSION_TOKEN en GitHub Secrets."
+            exit 1
+          fi
+
+      - name: Llave publica SSH a partir del secret EC2_SSH_KEY
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          if [ -z "$EC2_SSH_KEY" ]; then
+            echo "::error::Falta el secret EC2_SSH_KEY (llave privada SSH)."
+            exit 1
+          fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" | tr -d '\r' > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          echo "TF_VAR_ssh_public_key=$(ssh-keygen -y -f ~/.ssh/id_ed25519)" >> "$GITHUB_ENV"
+
+      - name: Bucket S3 para el tfstate (se crea si no existe)
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="tfstate-to-do-list-api-${ACCOUNT_ID}"
+          if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "Usando bucket existente: $BUCKET"
+          else
+            echo "Creando bucket: $BUCKET"
+            if [ "$AWS_REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$BUCKET"
+            else
+              aws s3api create-bucket --bucket "$BUCKET" \
+                --create-bucket-configuration LocationConstraint="$AWS_REGION"
+            fi
+            aws s3api wait bucket-exists --bucket "$BUCKET"
+            aws s3api put-bucket-versioning --bucket "$BUCKET" \
+              --versioning-configuration Status=Enabled
+            aws s3api put-public-access-block --bucket "$BUCKET" \
+              --public-access-block-configuration \
+              BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+          fi
+          echo "TF_STATE_BUCKET=$BUCKET" >> "$GITHUB_ENV"
+
+      - name: terraform init
+        run: terraform init -backend-config="bucket=$TF_STATE_BUCKET"
+
+      - name: terraform validate
+        run: terraform validate
+
+      - name: terraform plan
+        run: terraform plan -out=tfplan
+
+      - name: terraform apply
+        run: terraform apply tfplan
+
+      - name: Resumen
+        run: |
+          IP=$(terraform output -raw public_ip)
+          echo "EC2_PUBLIC_IP=$IP" >> "$GITHUB_ENV"
+          {
+            echo "## Infraestructura lista"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| IP publica | \`$IP\` |"
+            echo "| API | http://$IP:5000/tasks |"
+            echo "| Version | http://$IP:5000/version |"
+            echo "| tfstate | \`s3://$TF_STATE_BUCKET/to-do-list-api/terraform.tfstate\` |"
+            echo ""
+            echo "**Siguiente paso:** guarda \`$IP\` en el secret \`EC2_HOST\` (Settings > Secrets and variables > Actions)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "IP publica de la EC2: $IP"
+
+      - name: Guardar la IP en el secret EC2_HOST (opcional, requiere GH_PAT)
+        if: env.GH_PAT != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          printf '%s' "$EC2_PUBLIC_IP" | gh secret set EC2_HOST --repo "$GITHUB_REPOSITORY"
+          echo "Secret EC2_HOST actualizado a $EC2_PUBLIC_IP" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Esperar a que la app responda
+        run: |
+          echo "Esperando a que el user_data termine (puede tardar varios minutos)..."
+          for _ in $(seq 1 60); do
+            if curl -fsS --max-time 5 "http://$EC2_PUBLIC_IP:5000/health"; then
+              echo ""
+              echo "La app ya responde en http://$EC2_PUBLIC_IP:5000/tasks"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::warning::La app no respondio en 10 minutos. Entra por SSH y revisa /var/log/cloud-init-output.log"
