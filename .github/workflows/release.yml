@@ -1,0 +1,48 @@
+name: Release
+
+# Continuous Delivery: al empujar una etiqueta v#.#.# se crea un release
+# con el repositorio comprimido en zip.
+#   git tag v1.0.0 && git push origin v1.0.0
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  tests:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Comprimir el repositorio
+        run: |
+          ZIP="to-do-list-api-${GITHUB_REF_NAME}.zip"
+          git archive --format=zip -o "$ZIP" HEAD
+          unzip -l "$ZIP"
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
+      - name: Crear el release en GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$ZIP" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag
+
+  # Continuous Deployment: el release nuevo se instala en la EC2.
+  # Se llama directo porque un release creado con GITHUB_TOKEN no dispara
+  # el evento "release" en otros workflows.
+  deploy:
+    needs: release
+    uses: ./.github/workflows/deploy.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit

@@ -1,69 +1,139 @@
 #!/usr/bin/env python3
+"""To-do list API.
+
+Endpoints:
+  GET  /tasks    -> lista de tareas
+  POST /tasks    -> agrega una tarea. Body: {"tarea": "texto"}
+  GET  /version  -> version desplegada (variable de ambiente APP_VERSION)
+  GET  /health   -> estado de la app
+
+Si existe la variable DB_SECRET_ID, las tareas se guardan en RDS PostgreSQL
+(credenciales en Secrets Manager). Si no, se guardan en memoria: asi corren
+las pruebas y la app en tu compu sin base de datos.
+"""
 
 import json
 import os
+import threading
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import boto3
-import psycopg2
-import psycopg2.extras
 
-HOST = os.environ.get("HOST", "0.0.0.0")
-PORT = int(os.environ.get("PORT", "5000"))
-
-# Nombre del secreto en Secrets Manager (lo pone Terraform en el servicio systemd)
-SECRET_ID = os.environ["DB_SECRET_ID"]
-REGION = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+def get_version():
+    """La version la pone el deploy en la variable de ambiente APP_VERSION."""
+    return os.environ.get("APP_VERSION", "dev")
 
 
-def load_db_params():
-    """Lee las credenciales de RDS desde Secrets Manager.
-    boto3 usa automáticamente el IAM Role de la instancia: no hay llaves en el código."""
-    client = boto3.client("secretsmanager", region_name=REGION)
-    secret = json.loads(client.get_secret_value(SecretId=SECRET_ID)["SecretString"])
-    return {
-        "host": secret["host"],
-        "port": int(secret.get("port", 5432)),
-        "dbname": secret["dbname"],
-        "user": secret["username"],
-        "password": secret["password"],
-        "connect_timeout": 5,
-    }
+# ---------------------------------------------------------------------------
+# Almacenamiento
+# ---------------------------------------------------------------------------
+class MemoryTaskStore:
+    """Tareas en memoria (pruebas y desarrollo local)."""
+
+    def __init__(self):
+        self._tasks = []
+        self._lock = threading.Lock()
+
+    def init(self):
+        pass
+
+    def list_tasks(self):
+        with self._lock:
+            return [dict(task) for task in self._tasks]
+
+    def add_task(self, tarea):
+        with self._lock:
+            task = {
+                "id": len(self._tasks) + 1,
+                "tarea": tarea,
+                "creada": datetime.now(timezone.utc).isoformat(),
+            }
+            self._tasks.append(task)
+            return dict(task)
 
 
-DB_PARAMS = load_db_params()
+class PostgresTaskStore:
+    """Tareas en RDS PostgreSQL.
 
+    Las credenciales se leen de Secrets Manager; boto3 usa el IAM Role de la
+    instancia, asi que no hay contrasenas en el codigo.
+    """
 
-def run_query(sql, params=(), fetch=None):
-    """Abre una conexión por petición (simple y seguro con ThreadingHTTPServer)."""
-    conn = psycopg2.connect(**DB_PARAMS)
-    try:
-        with conn:  # commit si todo sale bien, rollback si hay excepción
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(sql, params)
-                if fetch == "all":
-                    return cur.fetchall()
-                if fetch == "one":
-                    return cur.fetchone()
-                return None
-    finally:
-        conn.close()
+    def __init__(self, secret_id, region):
+        # Se importan aqui para que las pruebas no dependan de boto3 ni psycopg2
+        import boto3
+        import psycopg2
+        import psycopg2.extras
 
+        self._psycopg2 = psycopg2
+        self._cursor_factory = psycopg2.extras.RealDictCursor
 
-def init_db():
-    run_query(
-        """
-        CREATE TABLE IF NOT EXISTS tasks (
-            id     SERIAL PRIMARY KEY,
-            tarea  TEXT NOT NULL,
-            creada TIMESTAMPTZ NOT NULL DEFAULT now()
+        client = boto3.client("secretsmanager", region_name=region)
+        secret = json.loads(client.get_secret_value(SecretId=secret_id)["SecretString"])
+        self._params = {
+            "host": secret["host"],
+            "port": int(secret.get("port", 5432)),
+            "dbname": secret["dbname"],
+            "user": secret["username"],
+            "password": secret["password"],
+            "connect_timeout": 5,
+        }
+
+    def _query(self, sql, params=(), fetch=None):
+        # Una conexion por peticion: simple y segura con ThreadingHTTPServer
+        conn = self._psycopg2.connect(**self._params)
+        try:
+            with conn:  # commit si todo sale bien, rollback si hay excepcion
+                with conn.cursor(cursor_factory=self._cursor_factory) as cur:
+                    cur.execute(sql, params)
+                    if fetch == "all":
+                        return cur.fetchall()
+                    if fetch == "one":
+                        return cur.fetchone()
+                    return None
+        finally:
+            conn.close()
+
+    def init(self):
+        self._query(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id     SERIAL PRIMARY KEY,
+                tarea  TEXT NOT NULL,
+                creada TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
         )
-        """
-    )
+
+    def list_tasks(self):
+        return self._query("SELECT id, tarea, creada FROM tasks ORDER BY id", fetch="all")
+
+    def add_task(self, tarea):
+        return self._query(
+            "INSERT INTO tasks (tarea) VALUES (%s) RETURNING id, tarea, creada",
+            (tarea,),
+            fetch="one",
+        )
 
 
+def create_store():
+    secret_id = os.environ.get("DB_SECRET_ID")
+    if not secret_id:
+        print("DB_SECRET_ID no esta definido: las tareas se guardan en memoria", flush=True)
+        return MemoryTaskStore()
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+    return PostgresTaskStore(secret_id, region)
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
 class TodoHandler(BaseHTTPRequestHandler):
-    server_version = "TodoList/2.0"
+    server_version = "TodoList/3.0"
+
+    @property
+    def store(self):
+        return self.server.store
 
     def _send_json(self, status, payload):
         body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
@@ -73,25 +143,26 @@ class TodoHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _server_error(self, exc):
+        print("Error al acceder a las tareas: %r" % (exc,), flush=True)
+        self._send_json(500, {"error": "error interno"})
+
     def _path(self):
         return self.path.split("?")[0].rstrip("/") or "/"
 
     def do_GET(self):
         path = self._path()
-        try:
-            if path == "/tasks":
-                rows = run_query(
-                    "SELECT id, tarea, creada FROM tasks ORDER BY id", fetch="all"
-                )
-                self._send_json(200, {"tasks": rows})
-            elif path in ("/", "/health"):
-                row = run_query("SELECT COUNT(*) AS total FROM tasks", fetch="one")
-                self._send_json(200, {"status": "ok", "total": row["total"]})
-            else:
-                self._send_json(404, {"error": "recurso no encontrado"})
-        except psycopg2.Error as exc:
-            print(f"Error de base de datos: {exc}", flush=True)
-            self._send_json(500, {"error": "error de base de datos"})
+        if path == "/version":
+            self._send_json(200, {"version": get_version()})
+        elif path in ("/", "/health"):
+            self._send_json(200, {"status": "ok", "version": get_version()})
+        elif path == "/tasks":
+            try:
+                self._send_json(200, {"tasks": self.store.list_tasks()})
+            except Exception as exc:  # noqa: BLE001
+                self._server_error(exc)
+        else:
+            self._send_json(404, {"error": "recurso no encontrado"})
 
     def do_POST(self):
         if self._path() != "/tasks":
@@ -104,7 +175,7 @@ class TodoHandler(BaseHTTPRequestHandler):
         try:
             data = json.loads(raw or b"{}")
         except json.JSONDecodeError:
-            self._send_json(400, {"error": "el body no es JSON válido"})
+            self._send_json(400, {"error": "el body no es JSON valido"})
             return
 
         tarea = data.get("tarea") if isinstance(data, dict) else None
@@ -113,25 +184,29 @@ class TodoHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            row = run_query(
-                "INSERT INTO tasks (tarea) VALUES (%s) RETURNING id, tarea, creada",
-                (tarea.strip(),),
-                fetch="one",
-            )
-            self._send_json(201, row)
-        except psycopg2.Error as exc:
-            print(f"Error de base de datos: {exc}", flush=True)
-            self._send_json(500, {"error": "error de base de datos"})
+            self._send_json(201, self.store.add_task(tarea.strip()))
+        except Exception as exc:  # noqa: BLE001
+            self._server_error(exc)
 
     def log_message(self, fmt, *args):
         print("%s - %s" % (self.address_string(), fmt % args), flush=True)
 
 
+def create_server(store, host="0.0.0.0", port=5000):
+    """Crea el servidor con el almacenamiento indicado (las pruebas usan memoria)."""
+    store.init()
+    server = ThreadingHTTPServer((host, port), TodoHandler)
+    server.daemon_threads = True
+    server.store = store
+    return server
+
+
 def main():
-    # Si la BD aún no responde, el proceso falla y systemd lo reinicia en 5 s
-    init_db()
-    server = ThreadingHTTPServer((HOST, PORT), TodoHandler)
-    print(f"Escuchando en http://{HOST}:{PORT}", flush=True)
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "5000"))
+    # Si la BD aun no responde, el proceso falla y systemd lo reinicia en 5 s
+    server = create_server(create_store(), host, port)
+    print("Version %s escuchando en http://%s:%s" % (get_version(), host, port), flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
