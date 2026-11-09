@@ -1,0 +1,31 @@
+name: CI
+
+# Corre las pruebas en cada PR hacia main. Con la regla de proteccion de main
+# ("Require status checks to pass" -> tests), un PR no se puede integrar si fallan.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_call: # lo reutiliza el workflow Release antes de publicar
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11" # la misma que corre en la EC2
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Pruebas unitarias
+        run: python -m pytest -v
