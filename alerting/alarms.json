@@ -1,0 +1,46 @@
+[
+  {
+    "AlarmName": "to-do-list-api-ec2-cpu-alta",
+    "AlarmDescription": "Metrica nativa (AWS/EC2 CPUUtilization). CPU promedio arriba de 80% durante 15 minutos seguidos: la t3.micro esta saturada o hay un proceso fuera de control. Accion: revisar trafico y procesos (top, journalctl -u todo) y, si es carga real, subir el tipo de instancia.",
+    "Namespace": "AWS/EC2",
+    "MetricName": "CPUUtilization",
+    "Dimensions": [
+      { "Name": "InstanceId", "Value": "${instance_id}" }
+    ],
+    "Statistic": "Average",
+    "Period": 300,
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "Threshold": 80,
+    "ComparisonOperator": "GreaterThanThreshold",
+    "TreatMissingData": "missing"
+  },
+  {
+    "AlarmName": "to-do-list-api-errores-rds",
+    "AlarmDescription": "Metrica propia DatabaseErrors (put_metric_data). Con la BD sana debe valer 0; cualquier error en 5 minutos significa que la app no puede leer o escribir en RDS. El health check corre cada 5 minutos, asi que una caida se detecta aunque no haya usuarios. Accion: revisar el estado de RDS en la consola, su Security Group y el secreto.",
+    "Namespace": "${metrics_namespace}",
+    "MetricName": "DatabaseErrors",
+    "Dimensions": [],
+    "Statistic": "Sum",
+    "Period": 300,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "Threshold": 1,
+    "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+    "TreatMissingData": "notBreaching"
+  },
+  {
+    "AlarmName": "to-do-list-api-pico-de-tareas",
+    "AlarmDescription": "Metrica propia TasksCreated (put_metric_data). Una persona crea pocas tareas por hora; mas de 100 en 5 minutos indica un bot, un abuso del API (no tiene autenticacion) o un cliente en un ciclo infinito. Accion: buscar la IP en los logs (journalctl -u todo), bloquearla en el Security Group y agregar rate limiting.",
+    "Namespace": "${metrics_namespace}",
+    "MetricName": "TasksCreated",
+    "Dimensions": [],
+    "Statistic": "Sum",
+    "Period": 300,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "Threshold": 100,
+    "ComparisonOperator": "GreaterThanThreshold",
+    "TreatMissingData": "notBreaching"
+  }
+]

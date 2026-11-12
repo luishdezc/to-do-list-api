@@ -1,0 +1,79 @@
+{
+  "start": "-PT3H",
+  "periodOverride": "inherit",
+  "widgets": [
+    {
+      "type": "text",
+      "x": 0,
+      "y": 0,
+      "width": 24,
+      "height": 2,
+      "properties": {
+        "markdown": "# to-do-list-api\nEC2 `${instance_id}` en `${region}`. Metrica nativa de AWS y metricas propias del namespace `${metrics_namespace}`. La linea roja es el umbral de cada alarma."
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 2,
+      "width": 8,
+      "height": 7,
+      "properties": {
+        "title": "CPU de la EC2 (%) - nativa AWS/EC2",
+        "view": "timeSeries",
+        "region": "${region}",
+        "stat": "Average",
+        "period": 300,
+        "metrics": [
+          ["AWS/EC2", "CPUUtilization", "InstanceId", "${instance_id}", { "label": "CPUUtilization" }]
+        ],
+        "yAxis": { "left": { "min": 0, "max": 100 } },
+        "annotations": {
+          "horizontal": [{ "label": "Alarma > 80%", "value": 80, "color": "#d62728" }]
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 8,
+      "y": 2,
+      "width": 8,
+      "height": 7,
+      "properties": {
+        "title": "Errores al leer/escribir en RDS",
+        "view": "timeSeries",
+        "region": "${region}",
+        "stat": "Sum",
+        "period": 300,
+        "metrics": [
+          ["${metrics_namespace}", "DatabaseErrors", { "label": "DatabaseErrors", "color": "#d62728" }]
+        ],
+        "yAxis": { "left": { "min": 0 } },
+        "annotations": {
+          "horizontal": [{ "label": "Alarma >= 1", "value": 1, "color": "#d62728" }]
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 16,
+      "y": 2,
+      "width": 8,
+      "height": 7,
+      "properties": {
+        "title": "Tareas creadas (cada 5 min)",
+        "view": "timeSeries",
+        "region": "${region}",
+        "stat": "Sum",
+        "period": 300,
+        "metrics": [
+          ["${metrics_namespace}", "TasksCreated", { "label": "TasksCreated", "color": "#2ca02c" }]
+        ],
+        "yAxis": { "left": { "min": 0 } },
+        "annotations": {
+          "horizontal": [{ "label": "Alarma > 100", "value": 100, "color": "#d62728" }]
+        }
+      }
+    }
+  ]
+}

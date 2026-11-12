@@ -1,0 +1,57 @@
+#!/bin/bash
+# Se ejecuta UNA vez, en el primer arranque de la EC2: clona el repositorio,
+# instala dependencias y levanta la app. Sin SSH ni scp.
+# Terraform reemplaza github_repo, db_secret_id, region, app_port y metrics_namespace.
+set -euxo pipefail
+
+REPO="${github_repo}"
+
+# --- Paquetes ------------------------------------------------------------------
+dnf install -y git unzip python3.11 python3.11-pip || dnf install -y git unzip python3-pip
+dnf install -y postgresql16 || dnf install -y postgresql15 || true   # cliente psql
+
+# --- Configuracion de la app ---------------------------------------------------
+mkdir -p /opt/todo/releases
+cat > /opt/todo/app.env <<EOF
+PORT=${app_port}
+DB_SECRET_ID=${db_secret_id}
+AWS_DEFAULT_REGION=${region}
+METRICS_ENABLED=true
+METRICS_NAMESPACE=${metrics_namespace}
+EOF
+
+# /opt/todo/current es un symlink a la version activa (lo cambia deploy.sh)
+cat > /etc/systemd/system/todo.service <<'UNIT'
+[Unit]
+Description=To-do list API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/todo/current/src
+EnvironmentFile=/opt/todo/app.env
+EnvironmentFile=-/opt/todo/version.env
+ExecStart=/opt/todo/current/venv/bin/python /opt/todo/current/src/main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable todo
+
+# --- Clonar el repositorio -----------------------------------------------------
+git clone "https://github.com/$REPO.git" /opt/todo/repo
+cd /opt/todo/repo
+
+# Usa el ultimo release (etiqueta v#.#.#) si ya tiene la estructura nueva; si no, main
+LATEST=$(git tag -l 'v*.*.*' --sort=-v:refname | head -n1)
+if [ -n "$LATEST" ] && git cat-file -e "$LATEST:src/main.py" 2>/dev/null; then
+  git checkout -q "$LATEST"
+fi
+VERSION=$(git describe --tags --always)
+
+# --- Instalar dependencias y levantar la app ------------------------------------
+bash scripts/deploy.sh "$REPO" "$VERSION" /opt/todo/repo
