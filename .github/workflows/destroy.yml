@@ -1,6 +1,6 @@
-name: Infra - destroy
+name: Destroy
 
-# Boton manual: Actions > "Infra - destroy" > Run workflow (escribe "destroy")
+# Boton manual: Actions > Destroy > Run workflow (escribe "destroy")
 on:
   workflow_dispatch:
     inputs:
@@ -8,7 +8,7 @@ on:
         description: 'Escribe "destroy" para confirmar'
         required: true
       instance_profile_name:
-        description: "El mismo valor que usaste en el apply"
+        description: "El mismo valor que usaste en Provision"
         required: false
         default: "LabInstanceProfile"
 
@@ -29,14 +29,19 @@ env:
   TF_INPUT: "false"
   TF_VAR_github_repo: ${{ github.repository }}
   TF_VAR_instance_profile_name: ${{ inputs.instance_profile_name }}
+  TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
 
 jobs:
   destroy:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: terraform
     steps:
       - name: Confirmacion
         if: inputs.confirm != 'destroy'
+        working-directory: .
         run: |
           echo "::error::Para destruir escribe exactamente: destroy"
           exit 1
@@ -96,5 +101,5 @@ jobs:
             echo "## Infraestructura destruida"
             echo ""
             echo "El bucket \`$TF_STATE_BUCKET\` se conserva con el tfstate vacio."
-            echo "Cuando vuelvas a correr **Infra - apply**, actualiza el secret \`EC2_HOST\` con la IP nueva."
+            echo "Si el workflow **Health check** sigue activo va a fallar hasta que vuelvas a correr **Provision**."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,57 @@
+name: Health check
+
+# Monitorea GET /health cada 5 minutos (y a mano desde Actions).
+# Falla si la app no responde o si la BD reporta FAIL.
+# Nota: GitHub puede retrasar unos minutos los workflows programados.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: health-check
+  cancel-in-progress: true
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+    steps:
+      - name: GET /health
+        run: |
+          if [ -z "$EC2_HOST" ]; then
+            echo "::error::Falta el secret EC2_HOST."
+            exit 1
+          fi
+          URL="http://${EC2_HOST}:8000/health"
+
+          # 3 intentos para no fallar por un error de red pasajero
+          for attempt in 1 2 3; do
+            CODE=$(curl -sS -o body.json -w '%{http_code}' --max-time 10 "$URL" || true)
+            BODY=$(cat body.json 2>/dev/null || true)
+            DB=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("database",""))' "$BODY" 2>/dev/null || true)
+            echo "Intento $attempt: HTTP $CODE $BODY"
+            if [ "$CODE" = "200" ] && [ "$DB" = "OK" ]; then
+              break
+            fi
+            sleep 10
+          done
+
+          {
+            echo "## /health"
+            echo ""
+            echo "- URL: $URL"
+            echo "- HTTP: \`${CODE:-sin respuesta}\`"
+            echo "- Respuesta: \`${BODY:-sin respuesta}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$CODE" != "200" ] || [ "$DB" != "OK" ]; then
+            echo "::error::La app no esta sana (HTTP ${CODE:-000}, database=${DB:-?})"
+            exit 1
+          fi
+          echo "OK: la app y la base de datos responden"

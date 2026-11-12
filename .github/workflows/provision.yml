@@ -1,6 +1,6 @@
-name: Infra - apply
+name: Provision
 
-# Boton manual: Actions > "Infra - apply" > Run workflow
+# Boton manual: Actions > Provision > Run workflow
 on:
   workflow_dispatch:
     inputs:
@@ -9,7 +9,7 @@ on:
         required: false
         default: "LabInstanceProfile"
 
-# Nunca dos corridas de Terraform al mismo tiempo (apply y destroy comparten grupo)
+# Nunca dos corridas de Terraform al mismo tiempo (Provision y Destroy comparten grupo)
 concurrency:
   group: terraform
   cancel-in-progress: false
@@ -27,11 +27,15 @@ env:
   TF_INPUT: "false"
   TF_VAR_github_repo: ${{ github.repository }}
   TF_VAR_instance_profile_name: ${{ inputs.instance_profile_name }}
+  TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
 
 jobs:
-  apply:
+  provision:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: terraform
     env:
       GH_PAT: ${{ secrets.GH_PAT }}
     steps:
@@ -46,6 +50,9 @@ jobs:
           if ! aws sts get-caller-identity; then
             echo "::error::Las credenciales de AWS no funcionan. Si es un sandbox nuevo, actualiza AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY y AWS_SESSION_TOKEN en GitHub Secrets."
             exit 1
+          fi
+          if [ -z "$TF_VAR_alert_email" ]; then
+            echo "::warning::No hay secret ALERT_EMAIL: las alarmas se crean pero no te llegara correo."
           fi
 
       - name: Llave publica SSH a partir del secret EC2_SSH_KEY
@@ -99,6 +106,7 @@ jobs:
       - name: Resumen
         run: |
           IP=$(terraform output -raw public_ip)
+          DASHBOARD=$(terraform output -raw dashboard_url)
           echo "EC2_PUBLIC_IP=$IP" >> "$GITHUB_ENV"
           {
             echo "## Infraestructura lista"
@@ -106,11 +114,15 @@ jobs:
             echo "| | |"
             echo "|---|---|"
             echo "| IP publica | \`$IP\` |"
-            echo "| API | http://$IP:5000/tasks |"
-            echo "| Version | http://$IP:5000/version |"
+            echo "| API | http://$IP:8000/tasks |"
+            echo "| Health | http://$IP:8000/health |"
+            echo "| Version | http://$IP:8000/version |"
+            echo "| Dashboard | $DASHBOARD |"
             echo "| tfstate | \`s3://$TF_STATE_BUCKET/to-do-list-api/terraform.tfstate\` |"
             echo ""
-            echo "**Siguiente paso:** guarda \`$IP\` en el secret \`EC2_HOST\` (Settings > Secrets and variables > Actions)."
+            echo "**Siguientes pasos:**"
+            echo "1. Guarda \`$IP\` en el secret \`EC2_HOST\`."
+            echo "2. Confirma la suscripcion de SNS en el correo que te mando AWS (cada sandbox nuevo crea un topico nuevo)."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "IP publica de la EC2: $IP"
 
@@ -126,9 +138,9 @@ jobs:
         run: |
           echo "Esperando a que el user_data termine (puede tardar varios minutos)..."
           for _ in $(seq 1 60); do
-            if curl -fsS --max-time 5 "http://$EC2_PUBLIC_IP:5000/health"; then
+            if curl -fsS --max-time 5 "http://$EC2_PUBLIC_IP:8000/health"; then
               echo ""
-              echo "La app ya responde en http://$EC2_PUBLIC_IP:5000/tasks"
+              echo "La app ya responde en http://$EC2_PUBLIC_IP:8000/tasks"
               exit 0
             fi
             sleep 10

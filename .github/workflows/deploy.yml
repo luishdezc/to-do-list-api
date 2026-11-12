@@ -70,15 +70,15 @@ jobs:
         run: |
           GOT=""
           for _ in $(seq 1 12); do
-            GOT=$(curl -fsS --max-time 5 "http://${EC2_HOST}:5000/version" \
+            GOT=$(curl -fsS --max-time 5 "http://${EC2_HOST}:8000/version" \
               | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' || true)
             if [ "$GOT" = "$TAG" ]; then
               echo "OK: /version = $GOT"
               {
                 echo "## Desplegado $TAG"
                 echo ""
-                echo "- http://${EC2_HOST}:5000/version"
-                echo "- http://${EC2_HOST}:5000/tasks"
+                echo "- http://${EC2_HOST}:8000/version"
+                echo "- http://${EC2_HOST}:8000/tasks"
               } >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
